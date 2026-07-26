@@ -1,7 +1,7 @@
-关于我们 About US
+# About US
 ModFuse-KAN adopts modality-separated KAN-GNN, Transformer and MLP branches to eliminate cross-modal feature suppression and achieve state-of-the-art molecular property prediction. 
 
-项目结构Project Structure
+# Project Structure
 (Please verify the integrity of the project structure and the correctness of folder naming before running the project.)
 ./
 ├── config/                  # 实验配置文件夹
