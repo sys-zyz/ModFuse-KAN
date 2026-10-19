@@ -1,6 +1,11 @@
 # About US
 ModFuse-KAN is a multimodal molecular property prediction model built upon KAN-enhanced graph neural network, Transformer encoder and physicochemical feature module. The model fuses graph topological information, SMILES sequence semantics and handcrafted molecular descriptors to accurately predict molecular bioactivity. 
 The architecture of ModFuse-KAN is as follows:
+<p align="center">
+<img src="ModFuse-KAN.png" width="800">
+<br>
+Figure 1: Overview architecture of ModFuse-KAN.
+</p>
 
 # Project Structure
 Please verify the integrity of the project structure and the correctness of folder naming before running the project.
