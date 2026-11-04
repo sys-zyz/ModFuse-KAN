@@ -1,18 +1,20 @@
 # 全局训练通用配置
-max_seq_len: 50
+max_seq_len: 150
 batch_size: 64
 lr: 0.00001
-epochs: 50
-weight_decay: 1e-5
-grad_clip_norm: 1.0
-patience: 10
+epochs: 200
+weight_decay: 1e-3
+grad_clip_norm: 0.5
+patience: 100
 device: "cpu"
 
 # 模型超参
-gnn_hidden: 256
+gnn_hidden: 128
 embed_dim: 128
-fusion_dim: 256
-fourier_order: 5
+fusion_dim: 128
+fourier_order: 3
+fp_dim: 256
+desc_dim: 8
 
 # 6个数据集配置
 datasets:
@@ -28,12 +30,12 @@ datasets:
     fp_dim: 256
     desc_dim: 8
   bbbp:
-    dataset_path: "/home/student/xjy/ke4y/data//bbbp.csv"
-    smiles_column_index: 0
+    dataset_path: "/home/student/xjy/ke4y/data/bbbp.csv"
+    smiles_column_index: 3
     fingerprint_column_index: -1
     descriptor_start_index: 0
     descriptor_end_index: 0
-    label_col_idx: 1
+    label_col_idx: 2
     fp_dim: 256
     desc_dim: 8
   bace:
@@ -42,7 +44,7 @@ datasets:
     fingerprint_column_index: -1
     descriptor_start_index: 0
     descriptor_end_index: 0
-    label_col_idx: 1
+    label_col_idx: 2
     fp_dim: 256
     desc_dim: 8
   clintox:
