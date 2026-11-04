@@ -14,6 +14,7 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score
 )
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import dgl
@@ -24,9 +25,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
-# ======================================================
-# º¯Êý¶¨ÒåÇø
-# ======================================================
+
 def set_seed(seed=42):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -54,6 +53,37 @@ def calc_8_mol_descriptors(smi):
     if np.isnan(desc_arr).any() or np.isinf(desc_arr).any():
         return None
     return desc_arr
+
+def compute_dataset_stats(data_list):
+    """
+    仅用训练集数据，统计原子特征和边特征的均值、标准差
+    返回：atom_mean, atom_std, edge_mean, edge_std
+    """
+    all_atom_feats = []
+    all_edge_feats = []
+    for smi, _, _, _ in data_list:
+        g = smiles_to_graph(smi)
+        if g is None:
+            continue
+        all_atom_feats.append(g.ndata['feat'])
+        if g.num_edges() > 0 and 'feat' in g.edata:
+            all_edge_feats.append(g.edata['feat'])
+
+    
+    # 按维度拼接所有原子/边的特征，全局统计
+    all_atom_feats = torch.cat(all_atom_feats, dim=0)
+    
+    atom_mean = all_atom_feats.mean(dim=0)
+    atom_std = all_atom_feats.std(dim=0)
+    if len(all_edge_feats) > 0:
+        all_edge_feats = torch.cat(all_edge_feats, dim=0)
+        edge_mean = all_edge_feats.mean(dim=0)
+        edge_std = all_edge_feats.std(dim=0)
+    else:
+        edge_mean = None
+        edge_std = None
+    
+    return atom_mean, atom_std, edge_mean, edge_std
 
 def calc_morgan_fingerprint_256(smi, radius=2, n_bits=256):
     mol = Chem.MolFromSmiles(smi)
@@ -170,7 +200,7 @@ def compute_metrics(trues, preds, threshold=0.5):
     valid_mask = ~np.isnan(trues)
     trues = trues[valid_mask]
     preds = preds[valid_mask]
-    trues = (trues >= 0.5).astype(np.int32)
+    trues = trues.astype(np.int32)
     preds_binary = (preds >= threshold).astype(int)
     unique_label = np.unique(trues)
     if len(unique_label) < 2:
@@ -271,9 +301,7 @@ def calc_multitask_pos_weight(train_data, task_num):
     pos_weight = np.where(pos_cnt == 0, 1.0, neg_cnt / pos_cnt)
     pos_weight = np.clip(pos_weight, a_min=0.1, a_max=100.0)
     return torch.tensor(pos_weight, dtype=torch.float32)
-# ======================================================
-# Dataset ¶¨Òå
-# ======================================================
+
 class BalancedDataset(Dataset):
     def __init__(self, data, tokenizer):
         self.pos = [d for d in data if d[1] == 1]
@@ -301,23 +329,33 @@ class BalancedDataset(Dataset):
 
 
 class NormalDataset(Dataset):
-    def __init__(self, data, tokenizer):
+    def __init__(self, data, tokenizer, atom_mean=None, atom_std=None, edge_mean=None, edge_std=None):
         self.data = data
         self.tokenizer = tokenizer
+        self.atom_mean = atom_mean
+        self.atom_std = atom_std
+        self.edge_mean = edge_mean
+        self.edge_std = edge_std
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         s, l, fp, desc = self.data[idx]
-        g = smiles_to_graph(s)
+        g = smiles_to_graph(
+            s,
+            atom_mean=self.atom_mean,
+            atom_std=self.atom_std,
+            edge_mean=self.edge_mean,
+            edge_std=self.edge_std
+        )
         tokens = self.tokenizer.encode(s)
         return (
             g,
             torch.tensor(tokens, dtype=torch.long),
             torch.tensor(fp, dtype=torch.float32),
             torch.tensor(desc, dtype=torch.float32),
-            torch.tensor([l], dtype=torch.float32)
+            torch.tensor(l, dtype=torch.float32)
         )
 class MoleculeDataset(Dataset):
     def __init__(self, data, tokenizer):
@@ -350,10 +388,8 @@ def collate_fn(batch):
     return bg, tokens, fps, descs, labels
 
 
-# ======================================================
-# ÑµÁ·/ÑéÖ¤º¯Êý
-# ======================================================
-def train_epoch(model, loader, optimizer, criterion, device):
+
+def train_epoch(model, loader, optimizer, criterion, device, grad_clip = 0.5):
     model.train()
     total_loss = 0
     valid_batch_count = 0 
@@ -366,9 +402,8 @@ def train_epoch(model, loader, optimizer, criterion, device):
         optimizer.zero_grad()
         out = model(g, t, fp, d)
         out = torch.nan_to_num(out, nan=0.0, posinf=1e5, neginf=-1e5)
-        if y.size(-1)==1:
-            y = y.squeeze(-1)
-        # 多任务掩码损失核心改动
+        y = y.reshape_as(out)
+        # 多任务掩码损失核心改
         mask = ~torch.isnan(y)
         valid_count = mask.sum()
         if valid_count.item() == 0:
@@ -381,7 +416,7 @@ def train_epoch(model, loader, optimizer, criterion, device):
         for p in model.parameters():
             if p.grad is not None:
                 torch.nan_to_num(p.grad, nan=0.0, out=p.grad)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
         total_loss += loss.item()
@@ -406,8 +441,7 @@ def eval_epoch(model, loader, criterion, device):
         g, t, fp, d, y = g.to(device), t.to(device), fp.to(device), d.to(device), y.to(device)
         out = model(g, t, fp, d)
         out = torch.nan_to_num(out, nan=0.0, posinf=1e5, neginf=-1e5)
-        if y.size(-1)==1:
-            y = y.squeeze(-1)
+        y = y.reshape_as(out)
         mask = ~torch.isnan(y)
         valid_count = mask.sum()
         if valid_count.item() == 0:
@@ -475,7 +509,16 @@ if __name__ == '__main__':
     print(f"原始总有效样本: {len(all_raw_data)}")
 
     all_task_result = []
+    best_val_task_results = []
 
+    lengths = np.array([len(item[0]) for item in all_raw_data])
+
+    print("SMILES 最大长度:", lengths.max())
+    print("SMILES 长度 95% 分位数:", np.percentile(lengths, 95))
+    print(
+        "超过 max_seq_len 的数量:",
+        int((lengths > config["max_seq_len"]).sum())
+    )
     for task_id in range(task_num):
         print(f"\n==================== 开始训练第 {task_id} 个任务 ====================")
 
@@ -526,21 +569,106 @@ if __name__ == '__main__':
             train_bal = balance_11_dataset(train_full, task_id)
             val_bal = val_full
             test_bal = test_full
-        else:
-            global_bal_data = balance_11_dataset(all_raw_data, task_id)
-            global_labels = np.array([item[1][task_id] for item in global_bal_data])
+        elif ds_name in ["bbbp", "bace"]:
+            raw_labels = np.array([item[1][task_id] for item in all_raw_data])
             split1 = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-            train_idx, temp_idx = next(split1.split(global_bal_data, global_labels))
-            train_full = [global_bal_data[i] for i in train_idx]
-            temp_full = [global_bal_data[i] for i in temp_idx]
-            temp_labels = np.array([item[1][task_id] for item in temp_full])
+            train_idx_raw, temp_idx_raw = next(split1.split(all_raw_data, raw_labels))
+            train_raw = [all_raw_data[i] for i in train_idx_raw]
+            temp_raw = [all_raw_data[i] for i in temp_idx_raw]
+
+            temp_raw_labels = np.array([item[1][task_id] for item in temp_raw])
             split2 = StratifiedShuffleSplit(n_splits=1, test_size=0.5, random_state=42)
-            val_idx, test_idx = next(split2.split(temp_full, temp_labels))
-            val_full = [temp_full[i] for i in val_idx]
-            test_full = [global_bal_data[i] for i in test_idx]
-            train_bal = train_full
+            val_idx_raw, test_idx_raw = next(split2.split(temp_raw, temp_raw_labels))
+            val_full = [temp_raw[i] for i in val_idx_raw]
+            test_full = [temp_raw[i] for i in test_idx_raw]
+            train_bal = train_raw
             val_bal = val_full
             test_bal = test_full
+        else:
+            task_data = [
+                item
+                for item in all_raw_data
+                if not np.isnan(item[1][task_id])
+            ]
+        
+            raw_labels = np.array([
+                item[1][task_id]
+                for item in task_data
+            ], dtype=np.float32)
+        
+            # 先检查当前任务是否同时包含正负样本
+            unique_labels = np.unique(raw_labels)
+        
+            if len(unique_labels) < 2:
+                print(
+                    f"任务{task_id}只有一个类别，跳过该任务："
+                    f"{unique_labels}"
+                )
+                continue
+        
+            split1 = StratifiedShuffleSplit(
+                n_splits=1,
+                test_size=0.2,
+                random_state=42
+            )
+        
+            train_idx, temp_idx = next(
+                split1.split(task_data, raw_labels)
+            )
+        
+            train_full = [
+                task_data[i]
+                for i in train_idx
+            ]
+        
+            temp_full = [
+                task_data[i]
+                for i in temp_idx
+            ]
+        
+            temp_labels = np.array([
+                item[1][task_id]
+                for item in temp_full
+            ], dtype=np.float32)
+        
+            split2 = StratifiedShuffleSplit(
+                n_splits=1,
+                test_size=0.5,
+                random_state=42
+            )
+        
+            val_idx, test_idx = next(
+                split2.split(temp_full, temp_labels)
+            )
+        
+            # 不做正负样本平衡，保留全部样本
+            train_bal = train_full
+        
+            val_bal = [
+                temp_full[i]
+                for i in val_idx
+            ]
+        
+            test_bal = [
+                temp_full[i]
+                for i in test_idx
+            ]
+        task_labels = np.array([
+            item[1][task_id]
+            for item in train_bal
+            if not np.isnan(item[1][task_id])
+        ], dtype=np.float32)
+
+        num_pos = int(np.sum(task_labels == 1.0))
+        num_neg = int(np.sum(task_labels == 0.0))
+        
+        pos_weight_val = num_neg / max(num_pos, 1)
+        
+        print(
+            f"数据集={ds_name}, "
+            f"任务={task_id}, "
+            f"pos_weight={pos_weight_val:.4f}"
+        )
         print(f"平衡后 | 训练:{len(train_bal)} 验证:{len(val_bal)} 测试:{len(test_bal)}")
         def slice_task_label(sample_list, tid):
             out = []
@@ -551,12 +679,41 @@ if __name__ == '__main__':
         train_bal = slice_task_label(train_bal, task_id)
         val_bal = slice_task_label(val_bal, task_id)
         test_bal = slice_task_label(test_bal, task_id)
-
+        desc_scaler = StandardScaler()
+        train_desc = np.stack([
+            np.asarray(item[3], dtype=np.float32)
+            for item in train_bal
+        ])
+        val_desc = np.stack([
+            np.asarray(item[3], dtype=np.float32)
+            for item in val_bal
+        ])
+        test_desc = np.stack([
+            np.asarray(item[3], dtype=np.float32)
+            for item in test_bal
+        ])
+        
+        train_desc = desc_scaler.fit_transform(train_desc).astype(np.float32)
+        val_desc = desc_scaler.transform(val_desc).astype(np.float32)
+        test_desc = desc_scaler.transform(test_desc).astype(np.float32)
+        
+        def replace_descriptors(data, desc_matrix):
+            return [
+                (smi, label, fp, desc_matrix[i])
+                for i, (smi, label, fp, _) in enumerate(data)
+            ]
+        
+        train_bal = replace_descriptors(train_bal, train_desc)
+        val_bal = replace_descriptors(val_bal, val_desc)
+        test_bal = replace_descriptors(test_bal, test_desc)
+        
+        print("描述符标准化完成：", train_desc.shape, val_desc.shape, test_desc.shape)
+        atom_mean, atom_std, edge_mean, edge_std = compute_dataset_stats(train_bal)
         tokenizer = SafeSMILESTokenizer(max_len=config['max_seq_len'])
-
-        train_dataset = NormalDataset(train_bal, tokenizer)
-        val_dataset = NormalDataset(val_bal, tokenizer)
-        test_dataset = NormalDataset(test_bal, tokenizer)
+        # 三个数据集全部复用训练集的统计量
+        train_dataset = NormalDataset(train_bal, tokenizer, atom_mean, atom_std, edge_mean, edge_std)
+        val_dataset = NormalDataset(val_bal, tokenizer, atom_mean, atom_std, edge_mean, edge_std)
+        test_dataset = NormalDataset(test_bal, tokenizer, atom_mean, atom_std, edge_mean, edge_std)
 
         train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn, num_workers=0, pin_memory=False)
         val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=0, pin_memory=False)
@@ -572,47 +729,52 @@ if __name__ == '__main__':
             weight_decay=float(config["weight_decay"])
         )
 
-        criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=torch.tensor([10.0]))
+        criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=torch.tensor([pos_weight_val]))
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'])
 
-        best_auc = 0.0
-        patience = config["patience"]
+        best_auc = -float("inf")
+        best_val_metrics = None
+        best_epoch = -1
+        patience = int(config["patience"])
         counter = 0
         for epoch in range(config['epochs']):
-            train_loss, train_preds, train_trues = train_epoch(model, train_loader, optimizer, criterion, device)
+            train_loss, train_preds, train_trues = train_epoch(model, train_loader, optimizer, criterion, device, grad_clip=config['grad_clip_norm'])
             scheduler.step()
         
-            model.eval()
-            train_all_preds = []
-            train_all_trues = []
-            with torch.no_grad():
-                for batch in train_loader:
-                    if batch is None:
-                        continue
-                    g, t, fp, d, y = batch
-                    g, t, fp, d, y = g.to(device), t.to(device), fp.to(device), d.to(device), y.to(device)
-                    out = model(g, t, fp, d)
-                    out = torch.nan_to_num(out, nan=0.0, posinf=1e5, neginf=-1e5)
-                    if y.size(-1)==1:
-                        y = y.squeeze(-1)
-                    train_all_preds.append(out.cpu())
-                    train_all_trues.append(y.cpu())
-            if len(train_all_preds) == 0 or len(train_all_trues) == 0:
-                train_metrics_full = {'auc': np.nan, 'aupr': np.nan, 'accuracy':0.0, 'precision':0.0, 'recall':0.0, 'f1':0.0}
+            if len(train_preds) == 0 or len(train_trues) == 0:
+                train_metrics_full = {'auc': np.nan, 'aupr': np.nan, 'accuracy':0.0,
+                                      'precision':0.0, 'recall':0.0, 'f1':0.0}
             else:
-                train_all_preds = torch.cat(train_all_preds, dim=0).numpy()
-                train_all_trues = torch.cat(train_all_trues, dim=0).numpy()
-                train_metrics_full = compute_metrics(np.concatenate(train_all_preds), np.concatenate(train_all_trues))
-        
+                train_all_preds = torch.cat(train_preds, dim=0).numpy()
+                train_all_trues = torch.cat(train_trues, dim=0).numpy()
+                train_metrics_full = compute_metrics(
+                    train_all_trues,
+                    train_all_preds
+                )
             val_loss, val_preds, val_trues = eval_epoch(model, val_loader, criterion, device)
-            val_metrics_full = compute_metrics(np.concatenate(val_preds), np.concatenate(val_trues))
+            val_all_preds = torch.cat(val_preds, dim=0).numpy()
+            val_all_trues = torch.cat(val_trues, dim=0).numpy()
+            
+            val_metrics_full = compute_metrics(
+                val_all_trues,
+                val_all_preds
+            )
             val_loss_current = val_loss
             if not np.isnan(val_metrics_full['auc']):
                 real_auc = val_metrics_full['auc']
                 if real_auc > best_auc:
                     best_auc = real_auc
+                    best_epoch = epoch
+                
+                    # 保存这一轮的全部验证集指标
+                    best_val_metrics = val_metrics_full.copy()
+                
                     counter = 0
-                    torch.save(model.state_dict(), f"{ds_name}_task{task_id}_best.pth")
+                
+                    torch.save(
+                        model.state_dict(),
+                        f"{ds_name}_task{task_id}_best.pth"
+                    )
                 else:
                     counter += 1
             else:
@@ -647,15 +809,60 @@ if __name__ == '__main__':
 
         model.load_state_dict(torch.load(f"{ds_name}_task{task_id}_best.pth", map_location=device))
         test_loss, test_preds, test_trues = eval_epoch(model, test_loader, criterion, device)
-        test_metrics = compute_metrics(np.concatenate(test_preds), np.concatenate(test_trues))
+        test_all_preds = torch.cat(test_preds, dim=0).numpy()
+        test_all_trues = torch.cat(test_trues, dim=0).numpy()
+
+        test_metrics = compute_metrics(
+            test_all_trues,
+            test_all_preds
+        )
         all_task_result.append(test_metrics)
+        if best_val_metrics is not None:
+            best_val_metrics = best_val_metrics.copy()
+            best_val_metrics["task_id"] = task_id
+            best_val_metrics["best_epoch"] = best_epoch
+        
+            best_val_task_results.append(best_val_metrics)
+        
+            print(
+                f"任务{task_id}最佳验证结果："
+                f"Epoch={best_epoch}, "
+                f"AUC={best_val_metrics['auc']:.4f}, "
+                f"AP={best_val_metrics['aupr']:.4f}, "
+                f"Acc={best_val_metrics['accuracy']:.4f}, "
+                f"Precision={best_val_metrics['precision']:.4f}, "
+                f"Recall={best_val_metrics['recall']:.4f}, "
+                f"F1={best_val_metrics['f1']:.4f}"
+            )
         print(f"任务{task_id} 测试指标：{test_metrics}")
         # 释放显存
         del model
         torch.cuda.empty_cache()
+    print("\n==================== 各任务最佳验证AUC对应指标的平均值 ====================")
 
-    print("\n==================== 全部任务平均指标 ====================")
-    metric_keys = ["auc", "aupr", "accuracy", "precision", "recall", "f1"]
+    metric_keys = [
+        "auc",
+        "aupr",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1"
+    ]
+    
     for key in metric_keys:
-        avg_val = np.mean([item[key] for item in all_task_result])
-        print(f"{key} 均值: {avg_val:.4f}")
+        values = [
+            item[key]
+            for item in best_val_task_results
+            if item is not None and not np.isnan(item[key])
+        ]
+    
+        if len(values) > 0:
+            avg_val = np.mean(values)
+            print(
+                f"最佳验证AUC轮次的 {key} 平均值: "
+                f"{avg_val:.4f}"
+            )
+        else:
+            print(
+                f"最佳验证AUC轮次的 {key} 平均值: nan"
+            )
